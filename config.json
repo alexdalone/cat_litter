@@ -1,0 +1,8 @@
+{
+  "camera": "/dev/video0",
+  "check_interval_sec": 1.0,
+  "min_present_checks": 2,
+  "min_absent_checks": 5,
+  "cooldown_sec": 30,
+  "roi": [200, 150, 900, 650]
+}

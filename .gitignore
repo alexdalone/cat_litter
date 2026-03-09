@@ -1,0 +1,18 @@
+# ignore snapshots
+snapshots/
+
+# ignore python virtual environment
+cat_litter_venv/
+
+# ignore runtime files
+*.jpg
+*.png
+*.log
+
+# ignore visit logs
+visits.csv
+
+# python cache
+__pycache__/
+*.pyc
+
