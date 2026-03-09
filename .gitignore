@@ -16,3 +16,4 @@ visits.csv
 __pycache__/
 *.pyc
 
+PAT.txt
