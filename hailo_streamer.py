@@ -4,6 +4,9 @@ os.environ["GST_PLUGIN_FEATURE_RANK"] = "vaapidecodebin:NONE"
 
 import time
 import threading
+from pathlib import Path
+from datetime import datetime
+
 import cv2
 import gi
 
@@ -36,6 +39,61 @@ STREAM_HEIGHT = 480
 JPEG_QUALITY = 60
 STREAM_EVERY_N_FRAMES = 3  # larger = less lag, lower FPS in browser
 
+# Recording settings
+SNAPSHOT_DIR = Path("snapshots")
+SNAPSHOT_DIR.mkdir(exist_ok=True)
+
+CAT_CONFIDENCE_THRESHOLD = 0.4
+CAT_LOST_TIMEOUT = 2.0
+RECORD_FPS = 10
+
+recording = False
+video_writer = None
+current_recording_path = None
+last_cat_seen = 0.0
+
+
+def start_recording(width, height):
+    global recording, video_writer, current_recording_path
+
+    if recording:
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    current_recording_path = SNAPSHOT_DIR / f"cat_visit_{timestamp}.mp4"
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    video_writer = cv2.VideoWriter(
+        str(current_recording_path),
+        fourcc,
+        RECORD_FPS,
+        (width, height)
+    )
+
+    if not video_writer.isOpened():
+        print(f"Failed to start recording: {current_recording_path}")
+        video_writer = None
+        current_recording_path = None
+        recording = False
+        return
+
+    recording = True
+    print(f"Recording started: {current_recording_path}")
+
+
+def stop_recording():
+    global recording, video_writer, current_recording_path
+
+    if video_writer is not None:
+        video_writer.release()
+        video_writer = None
+
+    if recording and current_recording_path is not None:
+        print(f"Recording saved: {current_recording_path}")
+
+    current_recording_path = None
+    recording = False
+
 
 class user_app_callback_class(app_callback_class):
     def __init__(self):
@@ -44,15 +102,11 @@ class user_app_callback_class(app_callback_class):
 
 
 def app_callback(element, buffer, user_data):
-    global latest_jpeg
+    global latest_jpeg, last_cat_seen, recording, video_writer
 
     frame_idx = user_data.get_count()
 
     if buffer is None:
-        return
-
-    # Skip frames for the web stream to reduce lag
-    if frame_idx % STREAM_EVERY_N_FRAMES != 0:
         return
 
     pad = element.get_static_pad("src")
@@ -76,17 +130,18 @@ def app_callback(element, buffer, user_data):
     else:
         frame_bgr = frame.copy()
 
-    # Draw detections
-    # Draw detections
+    # Detect cats and draw only cat detections
     roi = hailo.get_roi_from_buffer(buffer)
+    cat_detected = False
+
     for detection in roi.get_objects_typed(hailo.HAILO_DETECTION):
         label = detection.get_label()
         conf = detection.get_confidence()
 
-        # Only keep cats above threshold
-        if label != "cat" or conf < 0.4:
+        if label != "cat" or conf < CAT_CONFIDENCE_THRESHOLD:
             continue
 
+        cat_detected = True
         bbox = detection.get_bbox()
 
         x1 = int(bbox.xmin() * width)
@@ -117,10 +172,26 @@ def app_callback(element, buffer, user_data):
         2,
     )
 
-    # Resize smaller for less delay
+    # Resize once, then use this same frame for recording + streaming
     frame_bgr = cv2.resize(frame_bgr, (STREAM_WIDTH, STREAM_HEIGHT))
 
-    # Lower JPEG quality for lower latency
+    now = time.time()
+
+    if cat_detected:
+        last_cat_seen = now
+        if not recording:
+            start_recording(STREAM_WIDTH, STREAM_HEIGHT)
+
+    if recording and video_writer is not None:
+        video_writer.write(frame_bgr)
+
+    if recording and (now - last_cat_seen > CAT_LOST_TIMEOUT):
+        stop_recording()
+
+    # Only update browser stream every Nth frame to reduce lag
+    if frame_idx % STREAM_EVERY_N_FRAMES != 0:
+        return
+
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
     ok, buffer_jpg = cv2.imencode(".jpg", frame_bgr, encode_params)
     if not ok:
@@ -142,7 +213,6 @@ def mjpeg_generator():
             time.sleep(0.01)
             continue
 
-        # Do not resend identical frame over and over as fast as possible
         if frame == last_sent:
             time.sleep(0.01)
             continue
@@ -192,7 +262,11 @@ def main():
 
     hailo_logger.info("Open browser at http://<pi-ip>:5000")
     gst_app = GStreamerDetectionSimpleApp(app_callback, user_data)
-    gst_app.run()
+
+    try:
+        gst_app.run()
+    finally:
+        stop_recording()
 
 
 if __name__ == "__main__":
