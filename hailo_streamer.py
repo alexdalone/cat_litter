@@ -34,10 +34,10 @@ latest_jpeg = None
 jpeg_lock = threading.Lock()
 
 # Stream tuning
-STREAM_WIDTH = 640
-STREAM_HEIGHT = 480
-JPEG_QUALITY = 60
-STREAM_EVERY_N_FRAMES = 3  # larger = less lag, lower FPS in browser
+STREAM_WIDTH = 1080
+STREAM_HEIGHT = 720
+JPEG_QUALITY = 120
+STREAM_EVERY_N_FRAMES = 1  # larger = less lag, lower FPS in browser
 
 # Recording settings
 SNAPSHOT_DIR = Path("snapshots")
@@ -117,22 +117,12 @@ def app_callback(element, buffer, user_data):
     if fmt is None or width is None or height is None:
         return
 
-    frame = None
-    if user_data.use_frame:
-        frame = get_numpy_from_buffer(buffer, fmt, width, height)
+    now = time.time()
 
-    if frame is None:
-        return
-
-    # Convert to BGR for OpenCV drawing/encoding
-    if len(frame.shape) == 3 and frame.shape[2] == 3:
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    else:
-        frame_bgr = frame.copy()
-
-    # Detect cats and draw only cat detections
+    # Read detections first without pulling the full frame yet
     roi = hailo.get_roi_from_buffer(buffer)
     cat_detected = False
+    cat_boxes = []
 
     for detection in roi.get_objects_typed(hailo.HAILO_DETECTION):
         label = detection.get_label()
@@ -149,10 +139,38 @@ def app_callback(element, buffer, user_data):
         x2 = int(bbox.xmax() * width)
         y2 = int(bbox.ymax() * height)
 
+        cat_boxes.append((x1, y1, x2, y2, conf))
+
+    if cat_detected:
+        last_cat_seen = now
+        if not recording:
+            start_recording(STREAM_WIDTH, STREAM_HEIGHT)
+
+    if recording and (now - last_cat_seen > CAT_LOST_TIMEOUT):
+        stop_recording()
+
+    need_stream_frame = (frame_idx % STREAM_EVERY_N_FRAMES == 0)
+    need_record_frame = recording
+
+    # Do not extract/convert the image unless we actually need it
+    if not need_stream_frame and not need_record_frame:
+        return
+
+    frame = get_numpy_from_buffer(buffer, fmt, width, height)
+    if frame is None:
+        return
+
+    # Convert to BGR for OpenCV drawing/encoding
+    if len(frame.shape) == 3 and frame.shape[2] == 3:
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    else:
+        frame_bgr = frame.copy()
+
+    for x1, y1, x2, y2, conf in cat_boxes:
         cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(
             frame_bgr,
-            f"{label} {conf:.2f}",
+            f"cat {conf:.2f}",
             (x1, max(20, y1 - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -160,7 +178,6 @@ def app_callback(element, buffer, user_data):
             2,
         )
 
-    # Timestamp
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     cv2.putText(
         frame_bgr,
@@ -172,38 +189,21 @@ def app_callback(element, buffer, user_data):
         2,
     )
 
-    # Resize once, then use this same frame for recording + streaming
     frame_bgr = cv2.resize(frame_bgr, (STREAM_WIDTH, STREAM_HEIGHT))
-
-    now = time.time()
-
-    if cat_detected:
-        last_cat_seen = now
-        if not recording:
-            start_recording(STREAM_WIDTH, STREAM_HEIGHT)
 
     if recording and video_writer is not None:
         video_writer.write(frame_bgr)
 
-    if recording and (now - last_cat_seen > CAT_LOST_TIMEOUT):
-        stop_recording()
-
-    # Only update browser stream every Nth frame to reduce lag
-    if frame_idx % STREAM_EVERY_N_FRAMES != 0:
-        return
-
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-    ok, buffer_jpg = cv2.imencode(".jpg", frame_bgr, encode_params)
-    if not ok:
-        return
-
-    with jpeg_lock:
-        latest_jpeg = buffer_jpg.tobytes()
+    if need_stream_frame:
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        ok, buffer_jpg = cv2.imencode(".jpg", frame_bgr, encode_params)
+        if ok:
+            with jpeg_lock:
+                latest_jpeg = buffer_jpg.tobytes()
 
 
 def mjpeg_generator():
     global latest_jpeg
-    last_sent = None
 
     while True:
         with jpeg_lock:
@@ -213,16 +213,12 @@ def mjpeg_generator():
             time.sleep(0.01)
             continue
 
-        if frame == last_sent:
-            time.sleep(0.01)
-            continue
-
-        last_sent = frame
-
         yield (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
         )
+
+        time.sleep(0.03)
 
 
 @app.route("/")
