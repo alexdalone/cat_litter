@@ -36,21 +36,37 @@ jpeg_lock = threading.Lock()
 # Stream tuning
 STREAM_WIDTH = 1080
 STREAM_HEIGHT = 720
-JPEG_QUALITY = 120
-STREAM_EVERY_N_FRAMES = 1  # larger = less lag, lower FPS in browser
+JPEG_QUALITY = 85
+STREAM_EVERY_N_FRAMES = 1
 
 # Recording settings
 SNAPSHOT_DIR = Path("snapshots")
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 
-CAT_CONFIDENCE_THRESHOLD = 0.4
-CAT_LOST_TIMEOUT = 2.0
+CAT_CONFIDENCE_THRESHOLD = 0.3
+
+# Start after cat is present for this long
+CAT_START_DETECTION_SECONDS = 1.0
+
+# Stop after cat has been gone this long
+CAT_LOST_TIMEOUT = 5.0
+
 RECORD_FPS = 10
 
 recording = False
 video_writer = None
 current_recording_path = None
+
 last_cat_seen = 0.0
+cat_detection_start_time = None
+last_debug_print = 0.0
+
+
+def get_day_snapshot_dir():
+    day_str = datetime.now().strftime("%Y-%m-%d")
+    day_dir = SNAPSHOT_DIR / day_str
+    day_dir.mkdir(parents=True, exist_ok=True)
+    return day_dir
 
 
 def start_recording(width, height):
@@ -59,8 +75,12 @@ def start_recording(width, height):
     if recording:
         return
 
+    day_dir = get_day_snapshot_dir()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    current_recording_path = SNAPSHOT_DIR / f"cat_visit_{timestamp}.mp4"
+    current_recording_path = day_dir / f"cat_visit_{timestamp}.mp4"
+
+    print(f"[DEBUG] Attempting to start recording: {current_recording_path}")
+    print(f"[DEBUG] Writer size: {width}x{height}, fps={RECORD_FPS}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     video_writer = cv2.VideoWriter(
@@ -71,14 +91,14 @@ def start_recording(width, height):
     )
 
     if not video_writer.isOpened():
-        print(f"Failed to start recording: {current_recording_path}")
+        print(f"[ERROR] Failed to start recording: {current_recording_path}")
         video_writer = None
         current_recording_path = None
         recording = False
         return
 
     recording = True
-    print(f"Recording started: {current_recording_path}")
+    print(f"[INFO] Recording started: {current_recording_path}")
 
 
 def stop_recording():
@@ -89,7 +109,7 @@ def stop_recording():
         video_writer = None
 
     if recording and current_recording_path is not None:
-        print(f"Recording saved: {current_recording_path}")
+        print(f"[INFO] Recording saved: {current_recording_path}")
 
     current_recording_path = None
     recording = False
@@ -102,7 +122,8 @@ class user_app_callback_class(app_callback_class):
 
 
 def app_callback(element, buffer, user_data):
-    global latest_jpeg, last_cat_seen, recording, video_writer
+    global latest_jpeg
+    global last_cat_seen, recording, video_writer, cat_detection_start_time, last_debug_print
 
     frame_idx = user_data.get_count()
 
@@ -119,10 +140,10 @@ def app_callback(element, buffer, user_data):
 
     now = time.time()
 
-    # Read detections first without pulling the full frame yet
     roi = hailo.get_roi_from_buffer(buffer)
-    cat_detected = False
+    cat_detected_this_frame = False
     cat_boxes = []
+    max_cat_conf = 0.0
 
     for detection in roi.get_objects_typed(hailo.HAILO_DETECTION):
         label = detection.get_label()
@@ -131,9 +152,10 @@ def app_callback(element, buffer, user_data):
         if label != "cat" or conf < CAT_CONFIDENCE_THRESHOLD:
             continue
 
-        cat_detected = True
-        bbox = detection.get_bbox()
+        cat_detected_this_frame = True
+        max_cat_conf = max(max_cat_conf, conf)
 
+        bbox = detection.get_bbox()
         x1 = int(bbox.xmin() * width)
         y1 = int(bbox.ymin() * height)
         x2 = int(bbox.xmax() * width)
@@ -141,18 +163,38 @@ def app_callback(element, buffer, user_data):
 
         cat_boxes.append((x1, y1, x2, y2, conf))
 
-    if cat_detected:
+    if cat_detected_this_frame:
         last_cat_seen = now
-        if not recording:
+
+        if cat_detection_start_time is None:
+            cat_detection_start_time = now
+            print(f"[DEBUG] Cat detection streak started, conf={max_cat_conf:.2f}")
+
+        detection_duration = now - cat_detection_start_time
+
+        if now - last_debug_print > 0.5:
+            print(
+                f"[DEBUG] cat detected, conf={max_cat_conf:.2f}, "
+                f"streak={detection_duration:.2f}s, recording={recording}"
+            )
+            last_debug_print = now
+
+        if (not recording) and (detection_duration >= CAT_START_DETECTION_SECONDS):
             start_recording(STREAM_WIDTH, STREAM_HEIGHT)
+    else:
+        if not recording:
+            if cat_detection_start_time is not None:
+                print("[DEBUG] Cat streak reset before recording started")
+            cat_detection_start_time = None
 
     if recording and (now - last_cat_seen > CAT_LOST_TIMEOUT):
+        print("[DEBUG] Cat lost timeout reached, stopping recording")
         stop_recording()
+        cat_detection_start_time = None
 
     need_stream_frame = (frame_idx % STREAM_EVERY_N_FRAMES == 0)
     need_record_frame = recording
 
-    # Do not extract/convert the image unless we actually need it
     if not need_stream_frame and not need_record_frame:
         return
 
@@ -160,7 +202,6 @@ def app_callback(element, buffer, user_data):
     if frame is None:
         return
 
-    # Convert to BGR for OpenCV drawing/encoding
     if len(frame.shape) == 3 and frame.shape[2] == 3:
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     else:
@@ -186,6 +227,17 @@ def app_callback(element, buffer, user_data):
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (255, 255, 255),
+        2,
+    )
+
+    status_text = "RECORDING" if recording else "IDLE"
+    cv2.putText(
+        frame_bgr,
+        status_text,
+        (10, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 0, 255) if recording else (200, 200, 200),
         2,
     )
 
