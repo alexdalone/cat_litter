@@ -16,3 +16,14 @@ python hailo_streamer.py \
 View video stream from the following url:
 
 http://192.168.1.231:5000/video_feed/
+
+To make feed viewable over the internet use the following:
+sudo tailscale funnel --bg http://127.0.0.1:5000
+tailscale funnel status
+
+The feed should now be available at:
+https://arthurtracker.tailb5a2e4.ts.net
+or the pi tailscale url at port 5000
+
+To disable the public feed:
+sudo tailscale funnel --https=443 off
