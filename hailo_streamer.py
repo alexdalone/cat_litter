@@ -46,7 +46,7 @@ SNAPSHOT_DIR.mkdir(exist_ok=True)
 CAT_CONFIDENCE_THRESHOLD = 0.3
 
 # Start after cat is present for this long
-CAT_START_DETECTION_SECONDS = 1.0
+CAT_START_DETECTION_SECONDS = 2.0
 
 # Stop after cat has been gone this long
 CAT_LOST_TIMEOUT = 5.0
